@@ -30,10 +30,30 @@ if [ ${#LANGS[@]} -eq 0 ]; then
 fi
 
 CHUNK_ENTRIES=100
-MODEL=gemini-2.5-pro
+MODEL="${CLAUDE_MODEL:-sonnet}"
 CONTEXT="a Mandarin broadcast of the Beijing E-Town Half Marathon, featuring humanoid robots running alongside humans"
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 SRT_TOOL="$SCRIPT_DIR/srt-tool.py"
+
+SYSTEM_PROMPT="You are translating Mandarin Chinese subtitles from a Whisper transcript of $CONTEXT.
+
+Each input line has the format \"<<N>> content\", where N is a sequential number.
+
+FORMATTING RULES (strict):
+- Preserve the <<N>> prefix on every line exactly as it appears in the input.
+- Output exactly one line per input line — never merge or split lines.
+- Keep the same line order.
+- Output only the numbered translated lines — no preamble, no code fences, no commentary.
+
+HALLUCINATION HANDLING:
+Whisper hallucinates YouTube credit/outro lines when audio is silent, music or crowd noise. If a line's content is clearly one of these, output just the prefix with blank content (e.g. \"<<7>> \"). Known patterns:
+- Amara.org subtitle credits (由 Amara.org 社群提供的字幕 and variants)
+- Subtitle attributions: 中文字幕: [name], 字幕組: [name] (often celebrities like 李宗盛)
+- Outro boilerplate: 请订阅, 感谢观看, 谢谢大家, Thanks for watching
+- The same line repeating verbatim across many consecutive 30-second segments
+- Anything that clearly sounds like a YouTube credit rather than live sports commentary
+
+PREFER TRANSLATING OVER BLANKING. Short utterances (好, 对, 嗯, 等一下, 跳起来), interjections, casual chatter, segment-break transitions, and closing remarks ARE legitimate content — translate them. Blanks are only for clear YouTube-artifact hallucinations."
 
 mkdir -p "$OUTDIR"
 INPUT_ABS=$(realpath "$INPUT")
@@ -41,18 +61,20 @@ OUTDIR=$(realpath "$OUTDIR")
 
 lang_name() {
     case "$1" in
-        en) echo "English" ;;
-        es) echo "Spanish" ;;
-        fr) echo "French" ;;
-        de) echo "German" ;;
-        it) echo "Italian" ;;
-        pt) echo "Portuguese" ;;
-        ru) echo "Russian" ;;
-        ja) echo "Japanese" ;;
-        ko) echo "Korean" ;;
-        ar) echo "Arabic" ;;
-        hi) echo "Hindi" ;;
-        *)  echo "$1" ;;
+        en)       echo "English" ;;
+        es)       echo "Spanish" ;;
+        fr)       echo "French" ;;
+        de)       echo "German" ;;
+        it)       echo "Italian" ;;
+        pt)       echo "Portuguese" ;;
+        ru)       echo "Russian" ;;
+        ja|jp)    echo "Japanese" ;;
+        ko|kr)    echo "Korean" ;;
+        ar)       echo "Arabic" ;;
+        hi)       echo "Hindi" ;;
+        zh|zh-cn) echo "Simplified Chinese" ;;
+        zh-tw)    echo "Traditional Chinese" ;;
+        *)        echo "$1" ;;
     esac
 }
 
@@ -84,36 +106,29 @@ for LANG in "${LANGS[@]}"; do
         echo "  [$i/$N_CHUNKS] $NAME → $LNAME..."
         python3 "$SRT_TOOL" extract "$SRC" "$ZH_NUM"
         rm -f "$TR_NUM"
-        ZH_REL="$LANG/chunks/$NAME.zh.txt"
-        TR_REL="$LANG/chunks/$NAME.tr.txt"
-        (cd "$OUTDIR" && gemini -m "$MODEL" --approval-mode yolo -p "Read $ZH_REL in the current directory. Each line has the format \"<<N>> content\", where content is Mandarin Chinese commentary from $CONTEXT.
+        USER_PROMPT="Translate the following lines to $LNAME:
 
-Translate the content on each line into natural $LNAME and write the result to $TR_REL in the current directory.
-
-FORMATTING RULES (strict):
-- Preserve the <<N>> prefix on every line exactly as it appears in the input.
-- Output exactly one line per input line — never merge or split lines.
-- Keep the same line order.
-- Output only the numbered translated lines — no preamble, no code fences, no commentary.
-
-HALLUCINATION HANDLING:
-Whisper hallucinates YouTube credit/outro lines when audio is silent, music or crowd noise. If a line's content is clearly one of these, output just the prefix and blank content (e.g. \"<<7>> \"). Known patterns:
-- Amara.org subtitle credits (由 Amara.org 社群提供的字幕 and variants)
-- Subtitle attributions: 中文字幕: [name], 字幕組: [name] (often real celebrities like 李宗盛)
-- Outro boilerplate: 请订阅, 感谢观看, 谢谢大家, Thanks for watching
-- The same line repeating across multiple consecutive 30-second segments
-- Anything that sounds like a YouTube credit rather than live sports commentary
-
-When in doubt, prefer blank over translating a suspected hallucination." > "$DST.log" 2>&1) || true
+$(cat "$ZH_NUM")"
+        claude -p --tools "" --model "$MODEL" --output-format text \
+            --system-prompt "$SYSTEM_PROMPT" \
+            "$USER_PROMPT" > "$TR_NUM" 2> "$DST.log" || true
         if [ ! -s "$TR_NUM" ]; then
-            echo "    FAILED: no translation file produced (see $DST.log)"
-            continue
+            if grep -qE 'rate.?limit|429|quota|usage.limit' "$DST.log" 2>/dev/null; then
+                echo "    RATE LIMIT / QUOTA on $MODEL — aborting (see $DST.log)" >&2
+                exit 2
+            fi
+            echo "    FAILED: no translation file produced (see $DST.log)" >&2
+            exit 3
         fi
         python3 "$SRT_TOOL" reassemble "$SRC" "$TR_NUM" "$DST"
     done
-    if compgen -G "$OUTDIR/$LANG/chunks/chunk_[0-9][0-9][0-9].srt" >/dev/null; then
+    # Only combine if every chunk succeeded
+    DONE_COUNT=$(ls "$OUTDIR/$LANG/chunks/"chunk_[0-9][0-9][0-9].srt 2>/dev/null | wc -l)
+    if [ "$DONE_COUNT" -eq "$N_CHUNKS" ]; then
         cat "$OUTDIR/$LANG/chunks/"chunk_[0-9][0-9][0-9].srt > "$OUTDIR/$LANG.srt"
         echo "  combined → $OUTDIR/$LANG.srt"
+    else
+        echo "  SKIP combine: $DONE_COUNT/$N_CHUNKS chunks complete" >&2
     fi
 done
 
