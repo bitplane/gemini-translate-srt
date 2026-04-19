@@ -5,19 +5,16 @@ import re
 import sys
 from pathlib import Path
 
-ENTRY_RE = re.compile(
-    r'^\s*(\d+)\s*\n([0-9:,\. \->]+-->[0-9:,\. \->]+)\s*\n(.*?)\s*$',
-    re.DOTALL,
-)
-
-
 def parse_srt(path: Path):
     blocks = re.split(r'\n\s*\n', Path(path).read_text().strip())
     entries = []
     for block in blocks:
-        m = ENTRY_RE.match(block)
-        if m:
-            entries.append((m.group(1), m.group(2).strip(), m.group(3).strip()))
+        lines = block.split('\n')
+        if len(lines) >= 2 and lines[0].strip().isdigit() and '-->' in lines[1]:
+            idx = lines[0].strip()
+            ts = lines[1].strip()
+            content = '\n'.join(lines[2:]).strip()
+            entries.append((idx, ts, content))
     return entries
 
 
